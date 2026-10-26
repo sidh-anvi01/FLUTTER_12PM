@@ -1,0 +1,126 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {userId} (same as Firebase Auth UID)
+// Fields:
+//   - uid:          string (required, immutable) - Firebase Auth UID
+//   - email:        string (required, immutable) - user's email address
+//   - displayName:  string (optional, max 100 chars) - display name
+//   - createdAt:    timestamp (required, immutable) - account creation time
+//
+// Access pattern:
+//   - Only the owner (uid == request.auth.uid) may read or write their document.
+//   - PII (email) is stored here, so NO other user may read this document.
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─────────────────────────────────────────────
+    // Helper Functions
+    // ─────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+             request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+             request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+             email.matches('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function isRecent(time) {
+      return time is timestamp &&
+             time > request.time - duration.value(5, 'm') &&
+             time <= request.time;
+    }
+
+    // ─────────────────────────────────────────────
+    // Domain Validator: User profile document
+    // ─────────────────────────────────────────────
+
+    function isValidUser(data) {
+      // Allowed fields only — no schema pollution
+      return hasOnlyAllowedFields(['uid', 'email', 'displayName', 'createdAt']) &&
+             // Required fields
+             hasRequiredFields(['uid', 'email', 'createdAt']) &&
+             // uid must match the authenticated user
+             data.uid is string && data.uid == request.auth.uid &&
+             // email: string, valid format, max 254 chars (RFC 5321)
+             data.email is string &&
+             data.email.size() > 0 && data.email.size() <= 254 &&
+             isValidEmail(data.email) &&
+             // displayName: optional string, max 100 chars
+             (
+               !('displayName' in data) ||
+               (data.displayName is string && data.displayName.size() <= 100)
+             ) &&
+             // createdAt: must be a timestamp
+             data.createdAt is timestamp;
+    }
+
+    // ─────────────────────────────────────────────
+    // /users/{userId}
+    // ─────────────────────────────────────────────
+
+    match /users/{userId} {
+
+      // Only the owner may read their own profile (contains PII: email)
+      allow read: if isOwner(userId);
+
+      // Create: owner only, valid schema, uid not tampered, createdAt is recent
+      allow create: if isOwner(userId) &&
+                       isValidUser(request.resource.data) &&
+                       uidUnchanged() &&
+                       isRecent(request.resource.data.createdAt);
+
+      // Update: owner only, valid schema, immutable fields (uid, email, createdAt) unchanged
+      allow update: if isOwner(userId) &&
+                       isValidUser(request.resource.data) &&
+                       uidNotModified() &&
+                       areImmutableFieldsUnchanged(['uid', 'email', 'createdAt']);
+
+      // Delete: owner only
+      allow delete: if isOwner(userId);
+    }
+
+    // ─────────────────────────────────────────────
+    // Deny everything else by default
+    // ─────────────────────────────────────────────
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
